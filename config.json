@@ -1,0 +1,16 @@
+{
+  "DEPLOY_TOKEN": "",
+  "DISCORD_WEBHOOK": "",
+  "UNITY_AUTH_TOKEN": "",
+  "GIT_ROOT_PATH": "",
+  "GITHUB_ORG": "HouraiTeahouse",
+  "PROJECTS": {
+    "fantasy-crescendo": {
+      "url_format": "{base_url}/{project}/{branch}/{filename}_{filehash}",
+      "game_binary": {
+        "Windows": "fc.exe",
+        "Linux": "fc.x86_64"
+      }
+    }
+  }
+}
