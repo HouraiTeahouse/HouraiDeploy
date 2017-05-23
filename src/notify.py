@@ -14,7 +14,7 @@ class NotificationHandler(object):
 class DiscordNotifier(NotificationHandler):
 
     def notify(self, message):
-        if message is str:
+        if isinstance(message, str):
             requests.post(self.config.DISCORD_WEBHOOK, json={ "content": message })
         else:
             requests.post(self.config.DISCORD_WEBHOOK, json=message)
