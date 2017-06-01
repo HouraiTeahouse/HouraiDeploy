@@ -4,12 +4,21 @@ from util import namedtuple_from_mapping
 from zipfile import ZipFile
 from collections import OrderedDict
 from flask import request
+from werkzeug.utils import secure_filename
+from tempfile import TemporaryDirectory
 
 vars_regex = re.compile('{(.*?)}')
 prefix_regex = re.compile('{base_url}/?')
 
 file_dir = os.path.dirname(os.path.realpath(__file__))
 deploy_script = os.path.join(file_dir, 'deploy.sh')
+
+def get_platform(platform):
+    if "osx" in platform.lower():
+        return "OSX"
+    if "windows" in platform.lower():
+        return "Windows"
+    return "Linux";
 
 def inject_variables(path_format, vars_obj):
     matches = vars_regex.findall(path_format)
@@ -25,12 +34,16 @@ def inject_variables(path_format, vars_obj):
     return path
 
 
-def hash_file(filepath, block_size=65536):
+def hashf(file_source, block_size=65536):
     hasher = hashlib.sha256()
-    with open(filepath, 'rb') as file_source:
-        for block in iter(lambda: file_source.read(block_size), b''):
-            hasher.update(block)
+    for block in iter(lambda: file_source.read(block_size), b''):
+        hasher.update(block)
     return hasher.hexdigest()
+
+
+def hash_file(filepath, block_size=65536):
+    with open(filepath, 'rb') as file_source:
+        return hashf(file_source, block_size)
 
 
 def create_file_summary(filepath):
@@ -51,6 +64,24 @@ def download_file(url, path):
 def unzip_to_dir(file_path, dst_dir):
     with ZipFile(file_path) as zip_file:
         zip_file.extractall(path=dst_dir)
+
+
+def cloudflare_purge(config, url):
+    cloudflare_api = 'https://api.cloudflare.com/client/v4/zones/%s/purge_cache'
+    cloudflare_api = cloudflare_api % config.CLOUDFLARE_ZONE_ID
+    print('Purging cache for %s via %s' % (url, cloudflare_api))
+    clear_response = requests.delete(cloudflare_api,
+            headers= {
+                'Content-Type': 'application/json',
+                'X-Auth-Email': config.CLOUDFLARE_EMAIL,
+                'X-Auth-Key': config.CLOUDFLARE_API_KEY
+            },
+            json={
+                'files': [url]
+            })
+    print(clear_response.request)
+    print(clear_response.json())
+    clear_response.raise_for_status()
 
 
 def deploy_from_url(event):
@@ -104,11 +135,13 @@ def deploy_from_url(event):
 
         dest_dir = prefix_regex.sub(event.base_dir, event.url_format)
         dest_dir = inject_variables(dest_dir, event)
-        if not os.path.exists(dest_dir):
-            os.makedirs(dest_dir)
         print('Moving completed files from %s to %s' % (temp_data_dir, dest_dir))
         # Forcibly move and replace files. This should be an atomic change
-        subprocess.call('cp -Trf %s/ %s/' % (temp_data_dir, dest_dir), shell=True)
+
+        if os.path.exists(dest_dir):
+            shutil.rmtree(dest_dir)
+        os.rename(temp_data_dir, dest_dir)
+
         for directory, _, dir_files in os.walk(dest_dir):
             if any(fnmatch.fnmatch(directory, pattern) for pattern in exclude_files):
                 shutil.rmtree(directory)
@@ -117,25 +150,32 @@ def deploy_from_url(event):
                 relative_path = full_path.replace(abs_dir_path + os.path.sep, '')
                 if os.path.exists(full_path) and any(fnmatch.fnmatch(relative_path, pattern) for pattern in exclude_files):
                     os.remove(full_path)
+        # Purge CDN cache for index
+        index_url_format = "{base_url}/{project}/{branch}/{platform}/index.json"
+        index_url = inject_variables(index_url_format, event)
+        cloudflare_purge(event.config, index_url)
     finally:
         tempdir.cleanup()
 
+
 class DeployEvent(object):
 
-    def __init__(self, project, branch):
+    def __init__(self, project, branch, platform, config):
         self.project = project
         self.branch = branch
+        self.platform = platform
+        self.config = config
+
 
 class UnityDeployEvent(DeployEvent):
 
     def __init__(self, project, branch, config, platform, download_url):
-        super().__init__(project, branch)
-        self.config = config
+        super().__init__(project, branch, platform, config)
         self.url_format = '{base_url}/{project}/{branch}/{platform}'
         self.base_url = config.BASE_URL
         self.download_url = download_url
-        self.platform = platform
         self.base_dir = config.BASE_DIR
+
 
 class DeployHandler(object):
 
@@ -165,7 +205,42 @@ class GitDeploy(DeployHandler):
         has_branch = any(event.branch == name for name in map(lambda x: x['name'], branches))
         if not has_branch:
             return 'Invalid branch', 400
-        subprocess.Popen((deploy_script, event.project, branch))
+        subprocess.Popen((deploy_script, event.project, event.branch))
+
+
+class UploadDeploy(DeployHandler):
+
+    def deploy(self, event):
+        git_dir = os.path.join(self.config.GIT_ROOT_PATH, event.project, '.git')
+        if not os.path.isdir(git_dir):
+            return "{} is not a valid project".format(event.project), 400
+        branches = requests.get("https://api.github.com/repos/{0}/{1}/branches".format(
+            self.config.GITHUB_ORG, event.project)).json()
+        has_branch = any(event.branch == name for name in map(lambda x: x['name'], branches))
+        if not has_branch:
+            return 'Invalid branch', 400
+        project = event.config.PROJECTS.get(event.project)
+        if not project:
+            raise RuntimeError('No project configuration for %s has been set')
+        base_url = inject_variables(project['url'], event)
+        base_dir = inject_variables(project['download_location'], event)
+        if not os.path.exists(base_dir):
+            os.makedirs(base_dir)
+        upload = request.files.get('file')
+        if not upload:
+            return 'No uploaded file.', 400
+        filename = secure_filename(upload.filename)
+        path = os.path.join(base_dir, filename)
+        hash_path = os.path.join(base_dir, filename) + '.hash'
+        file_hash = hashf(upload)
+        print("Saving %s to %s (hash: %s)..." % (filename, path, file_hash))
+        upload.seek(0)
+        upload.save(path)
+        with open(hash_path, 'w') as hash_file:
+            hash_file.write(file_hash)
+        cloudflare_purge(event.config, os.path.join(base_url, filename))
+        cloudflare_purge(event.config, os.path.join(base_url, filename) + '.hash')
+
 
 BASE_UNITY_URL="https://build-api.cloud.unity3d.com"
 
@@ -189,13 +264,6 @@ class UnityGameDeploy(DeployHandler):
         share_request = requests.post(base_url + "/share", headers=headers)
         print ('Response: ' + str(share_request.json()))
         return "https://developer.cloud.unity3d.com/share/{0}/".format(share_request.json()['shareid'])
-
-    def get_platform(self, platform):
-        if "osx" in platform.lower():
-            return "OSX"
-        if "windows" in platform.lower():
-            return "Windows"
-        return "Linux";
 
     def Standard(self, message):
         def _create_content(json, target):
@@ -223,7 +291,7 @@ class UnityGameDeploy(DeployHandler):
         req = requests.get(base_url, headers=headers)
         build_obj = req.json()
         branch = build_obj['scmBranch']
-        platform = self.get_platform(build_obj['platform'])
+        platform = get_platform(build_obj['platform'])
         download_url = build_obj['links']['download_primary']['href']
         unity_event = UnityDeployEvent(target,
                                       branch,
